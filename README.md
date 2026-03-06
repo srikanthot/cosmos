@@ -6,12 +6,6 @@ A streaming RAG chatbot for PSEG field technicians. Ask questions against intern
 
 ---
 
-## Why not Azure AI Foundry Managed Agents?
-
-Azure AI Foundry Managed Agents (and Azure AI Agent Service) are **not available in Azure Government (GCC High)**. This repo implements the same architectural pattern in code — an `AgentRuntime` module inside the API that owns orchestration, with separate retrieval, context, and citation providers — without requiring the managed service.
-
----
-
 ## How it works
 
 The FastAPI route is intentionally thin. It validates the request, creates a session, and hands off to `AgentRuntime.run_stream()`. All orchestration lives in `agent_runtime/`.
@@ -125,37 +119,6 @@ Open [http://localhost:8501](http://localhost:8501).
 | `MAX_CHUNKS_PER_SOURCE` | no | Default: `2` |
 | `TRACE_MODE` | no | Default: `true`. Logs source / page / chunk_id / score per result |
 | `BACKEND_URL` | no | Default: `http://localhost:8000`. Frontend uses this to reach the API |
-
----
-
-## Sample interaction
-
-**Question:** How do I disconnect the main breaker on a Model 400 switchgear panel?
-
-**Streamed answer:**
-
-```
-To disconnect the main breaker on a Model 400 switchgear panel, follow these steps per [1]:
-
-1. Verify the panel is de-energized and all LOTO procedures are in place.
-2. Open the front panel door using the security key.
-3. Locate the main breaker handle on the upper-left section of the panel.
-4. Move the handle to the OFF (down) position until it clicks into place.
-5. Confirm the breaker status indicator turns red (open position).
-
-Sources:
-- switchgear_model400_manual.pdf (p.47)
-- safety_loto_procedures.pdf (p.12)
-```
-
-**Citations SSE event:**
-
-```
-event: citations
-data: {"citations":[{"source":"switchgear_model400_manual.pdf","page":"47","url":"","chunk_id":"chunk-0142"},{"source":"safety_loto_procedures.pdf","page":"12","url":"","chunk_id":"chunk-0031"}]}
-```
-
----
 
 ## Project layout
 
