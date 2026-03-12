@@ -1,12 +1,5 @@
-"""PSEG Tech Manual Agent — Streamlit chat UI.
-
-Non-streaming frontend version.
-Calls FastAPI backend /chat endpoint and renders final answer + citations.
-"""
-
 import os
 import uuid
-
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -16,8 +9,8 @@ load_dotenv(override=True)
 _backend_port = os.getenv("BACKEND_PORT", "8000")
 BACKEND_URL = os.getenv("BACKEND_URL", f"http://localhost:{_backend_port}").rstrip("/")
 FRONTEND_TITLE = os.getenv("FRONTEND_TITLE", "PSEG Tech Manual Agent")
+APP_VERSION = "frontend-json-v2"
 
-# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=FRONTEND_TITLE,
     page_icon="⚡",
@@ -25,7 +18,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Global CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     :root {
@@ -66,6 +58,7 @@ st.markdown("""
         border: 2px solid var(--border) !important;
         border-radius: 12px !important;
     }
+
     [data-testid="stChatInput"]:focus-within {
         border-color: var(--navy) !important;
     }
@@ -80,20 +73,16 @@ st.markdown("""
 
     [data-testid="stSidebar"] { background: var(--card) !important; }
 
-    .stSpinner > div { border-top-color: var(--orange) !important; }
-
     hr { border: none; height: 1px; background: #edf2f7; margin: 1rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state ──────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 def render_citations(citations: list) -> None:
     with st.expander(f"📚 Sources ({len(citations)})", expanded=False):
         for i, c in enumerate(citations, 1):
@@ -106,10 +95,11 @@ def render_citations(citations: list) -> None:
 
             display_name = title if title else source
             label = f"**{i}.** {display_name}"
+
             if title and title != source:
                 label += f"  _(file: {source})_"
             if section:
-                label += f"\n\n  > {section}"
+                label += f"\n\n> {section}"
             if page:
                 label += f" — p.{page}"
             if chunk_id:
@@ -159,6 +149,8 @@ def render_sidebar() -> None:
 
         st.markdown("**Tech Manual Agent**")
         st.caption("Powered by Azure AI · GCC High")
+        st.caption(f"App version: {APP_VERSION}")
+        st.caption(f"Backend URL: {BACKEND_URL}")
         st.markdown("---")
 
         st.markdown("**Backend Status**")
@@ -168,8 +160,8 @@ def render_sidebar() -> None:
                 st.success("Connected ✓")
             else:
                 st.warning(f"HTTP {r.status_code}")
-        except Exception:
-            st.error("Unreachable")
+        except Exception as e:
+            st.error(f"Unreachable: {e}")
 
         st.markdown("---")
 
@@ -199,7 +191,6 @@ def render_header() -> None:
     """, unsafe_allow_html=True)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     render_sidebar()
     render_header()
@@ -207,6 +198,7 @@ def main() -> None:
 
     if prompt := st.chat_input("Ask a question about PSEG technical manuals…"):
         st.session_state.messages.append({"role": "user", "content": prompt})
+
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -215,8 +207,10 @@ def main() -> None:
             full_answer = ""
 
             try:
+                url = f"{BACKEND_URL}/chat"
+
                 resp = requests.post(
-                    f"{BACKEND_URL}/chat",
+                    url,
                     json={
                         "question": prompt,
                         "session_id": st.session_state.session_id,
@@ -224,36 +218,35 @@ def main() -> None:
                     headers={"Content-Type": "application/json"},
                     timeout=120,
                 )
-                resp.raise_for_status()
 
-                payload = resp.json()
-                full_answer = payload.get("answer", "").strip()
-                citations_captured = payload.get("citations", [])
-
-                if full_answer:
-                    st.markdown(full_answer)
+                if resp.status_code != 200:
+                    full_answer = (
+                        f"Backend error: HTTP {resp.status_code}\n\n"
+                        f"URL: {url}\n\n"
+                        f"Body:\n{resp.text}"
+                    )
+                    st.error(full_answer)
                 else:
-                    full_answer = "No answer text returned from backend."
-                    st.warning(full_answer)
+                    payload = resp.json()
+                    full_answer = payload.get("answer", "").strip()
+                    citations_captured = payload.get("citations", [])
 
-                if citations_captured:
-                    st.markdown("---")
-                    render_citations(citations_captured)
+                    if full_answer:
+                        st.markdown(full_answer)
+                    else:
+                        full_answer = f"No answer text returned from backend.\n\nRaw payload:\n{payload}"
+                        st.warning(full_answer)
 
-            except requests.exceptions.ConnectionError:
-                full_answer = f"Cannot connect to backend at `{BACKEND_URL}`. Is it running?"
+                    if citations_captured:
+                        st.markdown("---")
+                        render_citations(citations_captured)
+
+            except requests.exceptions.ConnectionError as e:
+                full_answer = f"Cannot connect to backend at `{BACKEND_URL}`.\n\n{e}"
                 st.error(full_answer)
 
             except requests.exceptions.Timeout:
                 full_answer = "Request timed out. Please try again."
-                st.error(full_answer)
-
-            except requests.exceptions.HTTPError as e:
-                try:
-                    error_text = resp.text[:1500]
-                except Exception:
-                    error_text = ""
-                full_answer = f"Backend error: {e}\n\n{error_text}"
                 st.error(full_answer)
 
             except Exception as e:
