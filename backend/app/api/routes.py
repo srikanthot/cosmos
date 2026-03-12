@@ -1,16 +1,6 @@
-"""FastAPI routes — intentionally thin per the agent framework pattern.
-
-The route does exactly three things:
-  1. Validate the incoming request (Pydantic does this automatically).
-  2. Create an AgentSession.
-  3. Hand off to AgentRuntime.run_stream() and return StreamingResponse.
-
-No business logic lives here. Adding a new endpoint means adding a new
-thin route that delegates to a new AgentRuntime method.
-"""
+"""FastAPI routes — thin routes delegating to AgentRuntime."""
 
 import logging
-
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
@@ -21,25 +11,16 @@ from app.api.schemas import ChatRequest
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Single shared runtime instance — stateless, safe for concurrent requests
 _runtime = AgentRuntime()
 
 
 @router.post("/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
-    """Stream a grounded answer with citations via Server-Sent Events.
-
-    Request body: ``{"question": "...", "session_id": "optional-uuid"}``
-
-    Response: ``text/event-stream``
-    - Token data lines:      ``data: <token>\\n\\n``
-    - Keepalive ping:        ``event: ping\\ndata: keepalive\\n\\n``
-    - Structured citations:  ``event: citations\\ndata: {...}\\n\\n``
-    - End sentinel:          ``data: [DONE]\\n\\n``
-    """
+    """Stream a grounded answer with citations via Server-Sent Events."""
     logger.info(
         "POST /chat/stream | session=%s | question=%s",
-        request.session_id, request.question,
+        request.session_id,
+        request.question,
     )
 
     session = AgentSession(question=request.question)
@@ -54,3 +35,72 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/chat")
+async def chat(request: ChatRequest) -> dict:
+    """Return a grounded answer and citations as normal JSON."""
+    logger.info(
+        "POST /chat | session=%s | question=%s",
+        request.session_id,
+        request.question,
+    )
+
+    session = AgentSession(question=request.question)
+    if request.session_id:
+        session.session_id = request.session_id
+
+    # Reuse runtime logic if available
+    if hasattr(_runtime, "run"):
+        result = await _runtime.run(request.question, session)
+
+        if isinstance(result, dict):
+            return {
+                "answer": result.get("answer", ""),
+                "citations": result.get("citations", []),
+            }
+
+        return {
+            "answer": str(result),
+            "citations": [],
+        }
+
+    # Fallback: consume the existing stream and reconstruct final answer/citations
+    answer_parts = []
+    citations = []
+
+    async for chunk in _runtime.run_stream(request.question, session):
+        if not isinstance(chunk, str):
+            continue
+
+        line = chunk.strip()
+
+        if line.startswith("event: citations"):
+            continue
+
+        if line.startswith("data: [DONE]"):
+            break
+
+        if line.startswith("data: "):
+            value = line[len("data: ") :]
+
+            # try citations payload
+            if value.startswith("{") and '"citations"' in value:
+                try:
+                    import json
+                    payload = json.loads(value)
+                    citations.extend(payload.get("citations", []))
+                    continue
+                except Exception:
+                    pass
+
+            # ignore keepalive
+            if value == "keepalive":
+                continue
+
+            answer_parts.append(value.replace("\\n", "\n"))
+
+    return {
+        "answer": "".join(answer_parts).strip(),
+        "citations": citations,
+    }
