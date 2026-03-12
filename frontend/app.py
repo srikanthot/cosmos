@@ -1,12 +1,9 @@
 """PSEG Tech Manual Agent — Streamlit chat UI.
 
-Connects to the FastAPI backend via Server-Sent Events (SSE).
-Tokens stream live into the chat bubble. Citations arrive as a named
-SSE event at the end and render as a collapsible "Sources" panel.
-Keepalive ping events are consumed silently.
+Non-streaming frontend version.
+Calls FastAPI backend /chat endpoint and renders final answer + citations.
 """
 
-import json
 import os
 import uuid
 
@@ -96,48 +93,6 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
 
-# ── SSE consumer ──────────────────────────────────────────────────────────────
-def _token_stream(response: requests.Response, citations_out: list):
-    """Parse SSE manually from requests.iter_lines()."""
-    current_event = "message"
-    data_lines = []
-
-    for raw_line in response.iter_lines(decode_unicode=True):
-        if raw_line is None:
-            continue
-
-        line = raw_line.strip()
-
-        if line == "":
-            if data_lines:
-                data = "\n".join(data_lines)
-
-                if current_event == "citations":
-                    try:
-                        payload = json.loads(data)
-                        citations_out.extend(payload.get("citations", []))
-                    except json.JSONDecodeError:
-                        pass
-
-                elif current_event == "ping":
-                    pass
-
-                elif data == "[DONE]":
-                    break
-
-                else:
-                    yield data.replace("\\n", "\n")
-
-            current_event = "message"
-            data_lines = []
-            continue
-
-        if line.startswith("event:"):
-            current_event = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[len("data:"):].strip())
-
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def render_citations(citations: list) -> None:
     with st.expander(f"📚 Sources ({len(citations)})", expanded=False):
@@ -174,7 +129,6 @@ def render_history() -> None:
                 render_citations(msg["citations"])
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("""
@@ -228,7 +182,6 @@ def render_sidebar() -> None:
         st.caption(f"Session `{st.session_state.session_id[:8]}…`")
 
 
-# ── Header ─────────────────────────────────────────────────────────────────────
 def render_header() -> None:
     st.markdown("""
     <div style="background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
@@ -258,65 +211,34 @@ def main() -> None:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            citations_captured: list = []
-            full_answer: str = ""
+            citations_captured = []
+            full_answer = ""
 
             try:
-                chat_url = f"{BACKEND_URL}/chat/stream"
-
                 resp = requests.post(
-                    chat_url,
+                    f"{BACKEND_URL}/chat",
                     json={
                         "question": prompt,
                         "session_id": st.session_state.session_id,
                     },
-                    headers={
-                        "Accept": "text/event-stream",
-                        "Content-Type": "application/json",
-                    },
-                    stream=True,
+                    headers={"Content-Type": "application/json"},
                     timeout=120,
-                    allow_redirects=False,
                 )
+                resp.raise_for_status()
 
-                if resp.status_code >= 400:
-                    try:
-                        error_body = resp.text[:1500]
-                    except Exception:
-                        error_body = "<no response body>"
+                payload = resp.json()
+                full_answer = payload.get("answer", "").strip()
+                citations_captured = payload.get("citations", [])
 
-                    try:
-                        response_headers = dict(resp.headers)
-                    except Exception:
-                        response_headers = {}
-
-                    request_method = getattr(resp.request, "method", "<unknown>")
-                    request_url = getattr(resp.request, "url", "<unknown>")
-
-                    full_answer = (
-                        f"Backend error: HTTP {resp.status_code}\n\n"
-                        f"Request method: {request_method}\n\n"
-                        f"Request URL: {request_url}\n\n"
-                        f"Response URL: {resp.url}\n\n"
-                        f"Response headers: {response_headers}\n\n"
-                        f"Response body:\n{error_body}"
-                    )
-                    st.error(full_answer)
+                if full_answer:
+                    st.markdown(full_answer)
                 else:
-                    full_answer = st.write_stream(
-                        _token_stream(resp, citations_captured)
-                    ) or ""
+                    full_answer = "No answer text returned from backend."
+                    st.warning(full_answer)
 
-                    if not full_answer.strip():
-                        try:
-                            fallback_text = resp.text[:1500]
-                        except Exception:
-                            fallback_text = "<empty streamed response>"
-                        st.warning(f"No tokens rendered. Raw response preview:\n{fallback_text}")
-
-                    if citations_captured:
-                        st.markdown("---")
-                        render_citations(citations_captured)
+                if citations_captured:
+                    st.markdown("---")
+                    render_citations(citations_captured)
 
             except requests.exceptions.ConnectionError:
                 full_answer = f"Cannot connect to backend at `{BACKEND_URL}`. Is it running?"
@@ -324,6 +246,14 @@ def main() -> None:
 
             except requests.exceptions.Timeout:
                 full_answer = "Request timed out. Please try again."
+                st.error(full_answer)
+
+            except requests.exceptions.HTTPError as e:
+                try:
+                    error_text = resp.text[:1500]
+                except Exception:
+                    error_text = ""
+                full_answer = f"Backend error: {e}\n\n{error_text}"
                 st.error(full_answer)
 
             except Exception as e:
