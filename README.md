@@ -212,3 +212,14 @@ pseg-agent-pattern-python/
     ├── requirements.txt
     └── app.py                             # Streamlit UI + SSE consumer
 ```
+
+FEEDBACK_URL = os.getenv("FEEDBACK_URL", "").strip()
+if FEEDBACK_URL:
+    st.markdown("### Feedback")
+    st.markdown(
+        f'<a href="{FEEDBACK_URL}" target="_blank">'
+        f'<button style="width:100%;padding:10px;border:none;border-radius:8px;'
+        f'background:#f26522;color:white;font-weight:600;cursor:pointer;">'
+        f'📝 Share Feedback</button></a>',
+        unsafe_allow_html=True,
+    )
