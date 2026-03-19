@@ -84,3 +84,26 @@ if _allowed_origins_raw.strip() == "*":
     ALLOWED_ORIGINS: list[str] = ["*"]
 else:
     ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
+
+# ---------------------------------------------------------------------------
+# Azure Cosmos DB — persistent chat history
+# ---------------------------------------------------------------------------
+# Auth mode: "key" (local/dev) or "managed_identity" (production)
+COSMOS_AUTH_MODE: str = os.getenv("COSMOS_AUTH_MODE", "key")
+COSMOS_ENDPOINT: str = os.getenv("COSMOS_ENDPOINT", "")
+COSMOS_KEY: str = os.getenv("COSMOS_KEY", "")
+COSMOS_DATABASE: str = os.getenv("COSMOS_DATABASE", "pseg-chatbot")
+COSMOS_CONVERSATIONS_CONTAINER: str = os.getenv("COSMOS_CONVERSATIONS_CONTAINER", "conversations")
+COSMOS_MESSAGES_CONTAINER: str = os.getenv("COSMOS_MESSAGES_CONTAINER", "messages")
+# Auto-create database and containers on startup if they don't exist
+COSMOS_AUTO_CREATE_CONTAINERS: bool = os.getenv("COSMOS_AUTO_CREATE_CONTAINERS", "true").lower() == "true"
+# Max prior turns (messages) to load per thread for LLM context
+COSMOS_HISTORY_MAX_TURNS: int = int(os.getenv("COSMOS_HISTORY_MAX_TURNS", "12"))
+# TTL — set COSMOS_ENABLE_TTL=true to auto-expire documents
+COSMOS_ENABLE_TTL: bool = os.getenv("COSMOS_ENABLE_TTL", "false").lower() == "true"
+COSMOS_TTL_SECONDS: int = int(os.getenv("COSMOS_TTL_SECONDS", "7776000"))  # 90 days
+
+# ---------------------------------------------------------------------------
+# Identity — local dev default user when no auth headers are present
+# ---------------------------------------------------------------------------
+DEFAULT_LOCAL_USER_ID: str = os.getenv("DEFAULT_LOCAL_USER_ID", "local-user")

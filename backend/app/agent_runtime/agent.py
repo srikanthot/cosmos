@@ -7,15 +7,21 @@ Architecture (replaces the hand-rolled LLM loop with official SDK primitives):
   routes.py              thin: validate → create session → call runtime
        ↓
   AgentRuntime.run_stream()
-    1. retrieve()         embed query → hybrid Azure AI Search (VectorizedQuery)
-    2. GATE               abort early if evidence count or avg score too low
-    3. rag_provider       store pre-retrieved results in session.state
-    4. af_agent.run()     Agent Framework ChatAgent → AzureOpenAIChatClient
-                            • InMemoryHistoryProvider  multi-turn memory
-                            • RagContextProvider.before_run()  injects chunks
-                            • LLM streams tokens via ResponseStream
-    5. SSE stream         yield tokens + keepalive pings
-    6. CitationProvider   dedup + emit structured citations event
+    1. resolve_identity()  derive user_id from request headers
+    2. resolve thread      use session_id as thread_id; create if new
+    3. persist user msg    save to Cosmos before generation
+    4. retrieve()          embed query → hybrid Azure AI Search (VectorizedQuery)
+    5. GATE                abort early if evidence count or avg score too low
+    6. hydrate session     load Cosmos history into AF session if cold-start
+    7. rag_provider        store pre-retrieved results in session.state
+    8. af_agent.run()      Agent Framework ChatAgent → AzureOpenAIChatClient
+                             • InMemoryHistoryProvider  multi-turn memory
+                             • CosmosHistoryProvider    cold-start history injection
+                             • RagContextProvider       injects chunks
+                             • LLM streams tokens via ResponseStream
+    9. SSE stream          yield tokens + keepalive pings
+   10. CitationProvider    dedup + emit structured citations event
+   11. persist assistant   save answer + citations to Cosmos after generation
        ↓
   SSE stream → Streamlit UI
 
@@ -23,7 +29,8 @@ Why Agent Framework?
   - AzureOpenAIChatClient owns the Azure OpenAI connection (API-key auth).
   - ChatAgent (via as_agent()) handles prompt assembly, history, and streaming.
   - RagContextProvider.before_run() is the official SDK hook for RAG injection.
-  - InMemoryHistoryProvider maintains multi-turn memory locally.
+  - CosmosHistoryProvider.before_run() injects cold-start Cosmos history once.
+  - InMemoryHistoryProvider maintains multi-turn memory for the process lifetime.
   - Azure AI Foundry Managed Agents are unavailable in GCC High — this pattern
     gives the same architecture without the managed service.
 """
@@ -37,10 +44,21 @@ from collections.abc import AsyncGenerator
 from agent_framework import AgentSession as AFAgentSession
 
 from app.agent_runtime.citation_provider import build_citations
+from app.agent_runtime.history_context_provider import format_history_block
 from app.agent_runtime.session import AgentSession
 from app.api.schemas import CitationsPayload
-from app.config.settings import MIN_AVG_SCORE, MIN_RERANKER_SCORE, MIN_RESULTS, TOP_K, TRACE_MODE
-from app.llm.af_agent_factory import af_agent, rag_provider
+from app.auth.identity import UserIdentity
+from app.config.settings import (
+    COSMOS_HISTORY_MAX_TURNS,
+    MIN_AVG_SCORE,
+    MIN_RERANKER_SCORE,
+    MIN_RESULTS,
+    TOP_K,
+    TRACE_MODE,
+)
+from app.llm.af_agent_factory import af_agent, history_provider, rag_provider
+from app.storage import chat_store
+from app.storage.cosmos_client import is_storage_enabled
 from app.tools.retrieval_tool import retrieve
 
 logger = logging.getLogger(__name__)
@@ -49,9 +67,11 @@ logger = logging.getLogger(__name__)
 _PING_INTERVAL_SECONDS = 20
 
 # Per conversation-session cache of Agent Framework sessions.
-# Keyed by the session_id from the HTTP request (our AgentSession.session_id).
+# Keyed by thread_id (our AgentSession.session_id).
 # InMemoryHistoryProvider stores message history inside each AFAgentSession.state,
 # giving multi-turn memory for the lifetime of the process.
+# When the process restarts this dict is empty; Cosmos history is re-injected
+# by CosmosHistoryProvider on the first call for each cold-started thread.
 _af_sessions: dict[str, AFAgentSession] = {}
 
 
@@ -71,17 +91,18 @@ def _sse_event(event_name: str, payload: str) -> str:
 
 
 class AgentRuntime:
-    """Orchestrates the full retrieve → gate → generate → cite pipeline.
+    """Orchestrates the full retrieve → gate → generate → cite → persist pipeline.
 
     Uses the Microsoft Agent Framework SDK for LLM invocation, context
-    injection (RagContextProvider), and conversation memory
-    (InMemoryHistoryProvider).
+    injection (RagContextProvider, CosmosHistoryProvider), and conversation
+    memory (InMemoryHistoryProvider).
     """
 
     async def run_stream(
         self,
         question: str,
         session: AgentSession,
+        identity: UserIdentity,
         top_k: int = TOP_K,
     ) -> AsyncGenerator[str, None]:
         """Execute the pipeline and yield SSE-formatted strings.
@@ -95,19 +116,31 @@ class AgentRuntime:
             SSE strings: token data lines, named events (citations, ping),
             and the final ``[DONE]`` sentinel.
         """
+        user_id = identity.user_id
+        user_name = identity.user_name
+        thread_id = session.session_id
+
         logger.info(
-            "AgentRuntime.run_stream | session=%s | question=%s",
-            session.session_id, question,
+            "AgentRuntime.run_stream | thread=%s user=%s auth=%s | question=%s",
+            thread_id, user_id, identity.auth_source, question,
         )
 
-        # ── 1. RETRIEVE — hybrid Azure AI Search (keyword + VectorizedQuery) ──
+        # ── 1. Ensure conversation exists in Cosmos ───────────────────────────
+        if is_storage_enabled():
+            await chat_store.get_or_create_conversation(thread_id, user_id, user_name)
+
+        # ── 2. Persist user message BEFORE generation ─────────────────────────
+        if is_storage_enabled():
+            await chat_store.append_user_message(thread_id, user_id, question)
+
+        # ── 3. RETRIEVE — hybrid Azure AI Search (keyword + VectorizedQuery) ──
         # Runs in a thread to avoid blocking the async event loop.
         try:
             results: list[dict] = await asyncio.to_thread(
                 retrieve, question, top_k=top_k
             )
         except Exception:
-            logger.exception("Retrieval failed")
+            logger.exception("Retrieval failed | thread=%s", thread_id)
             yield _sse_data(
                 "I'm sorry — an error occurred while searching the knowledge base. "
                 "Please try again."
@@ -116,9 +149,7 @@ class AgentRuntime:
             yield _sse_data("[DONE]")
             return
 
-        # ── 2. GATE — confidence check ────────────────────────────────────────
-        # When semantic reranker is active, gate on reranker_score (0-4 scale).
-        # Otherwise gate on base RRF/hybrid score (0.01-0.033 scale).
+        # ── 4. GATE — confidence check ────────────────────────────────────────
         has_reranker = bool(results) and results[0].get("reranker_score") is not None
         if has_reranker:
             avg_effective = (
@@ -133,45 +164,72 @@ class AgentRuntime:
 
         if TRACE_MODE:
             logger.info(
-                "TRACE | n_results=%d  avg_effective=%.4f  gate=(>=%d results, >=%.3f)  "
-                "semantic_reranker=%s",
-                len(results), avg_effective, MIN_RESULTS, gate_threshold, has_reranker,
+                "TRACE | thread=%s n_results=%d  avg_effective=%.4f  "
+                "gate=(>=%d results, >=%.3f)  semantic_reranker=%s",
+                thread_id, len(results), avg_effective,
+                MIN_RESULTS, gate_threshold, has_reranker,
             )
 
         if len(results) < MIN_RESULTS or avg_effective < gate_threshold:
             logger.info(
-                "Gate: insufficient evidence (n=%d avg=%.4f threshold_n=%d threshold=%.3f)",
-                len(results), avg_effective, MIN_RESULTS, gate_threshold,
+                "Gate: insufficient evidence | thread=%s n=%d avg=%.4f "
+                "threshold_n=%d threshold=%.3f",
+                thread_id, len(results), avg_effective, MIN_RESULTS, gate_threshold,
             )
-            yield _sse_data(
+            insufficient_msg = (
                 "I don't have enough evidence from the technical manuals to answer "
                 "your question confidently.\n\n"
                 "Could you provide more detail — for example, the equipment name, "
                 "model number, or the specific procedure you are looking for?"
             )
+            yield _sse_data(insufficient_msg)
             yield _sse_event(
                 "citations",
                 CitationsPayload(citations=[]).model_dump_json(),
             )
             yield _sse_data("[DONE]")
+            # Still persist the assistant's "no evidence" reply
+            if is_storage_enabled():
+                await chat_store.append_assistant_message(
+                    thread_id, user_id, insufficient_msg, citations=[]
+                )
             return
 
-        # ── 3. Get or create Agent Framework session (multi-turn memory) ──────
-        af_session = _af_sessions.get(session.session_id)
+        # ── 5. Get or create Agent Framework session ──────────────────────────
+        is_cold_start = thread_id not in _af_sessions
+        af_session = _af_sessions.get(thread_id)
+
         if af_session is None:
             af_session = af_agent.create_session()
-            _af_sessions[session.session_id] = af_session
+            _af_sessions[thread_id] = af_session
+            logger.info(
+                "AgentRuntime: new AF session created | thread=%s", thread_id
+            )
 
-        # ── 4. Hand pre-retrieved results to RagContextProvider ───────────────
-        # RagContextProvider.before_run() reads from session.state and injects
-        # the chunks as grounded context — no double Search call.
+            # ── 6. Hydrate cold-started session with Cosmos history ───────────
+            if is_storage_enabled():
+                prior_messages = await chat_store.get_messages(
+                    thread_id, max_turns=COSMOS_HISTORY_MAX_TURNS
+                )
+                if prior_messages:
+                    block = format_history_block(prior_messages)
+                    history_provider.store_history_block(af_session, block)
+                    logger.info(
+                        "AgentRuntime: loaded %d prior turns from Cosmos | thread=%s",
+                        len(prior_messages), thread_id,
+                    )
+        else:
+            logger.info(
+                "AgentRuntime: warm AF session reused | thread=%s", thread_id
+            )
+
+        # ── 7. Hand pre-retrieved results to RagContextProvider ───────────────
         rag_provider.store_results(af_session, results)
 
-        # ── 5. GENERATE — stream via Agent Framework ChatAgent ────────────────
-        # af_agent.run(stream=True) returns a ResponseStream (AsyncIterable).
-        # Each AgentResponseUpdate carries the streamed token in .text.
+        # ── 8. GENERATE — stream via Agent Framework ChatAgent ────────────────
         last_ping_at = time.monotonic()
         answer_buf: list[str] = []
+        stream_error = False
         try:
             async for update in af_agent.run(
                 question, stream=True, session=af_session
@@ -186,18 +244,32 @@ class AgentRuntime:
                     yield _sse_data(update.text)
 
         except Exception:
-            logger.exception("LLM streaming failed")
+            logger.exception("LLM streaming failed | thread=%s", thread_id)
+            stream_error = True
             yield _sse_data(
                 "\n\nI'm sorry — an error occurred while generating the answer. "
                 "Please try again."
             )
 
-        # ── 6. CITE — only emit citations if the agent actually used sources ──
-        # If the answer contains [N] citation markers or a "Sources:" section
-        # the model drew from the retrieved context; otherwise it couldn't
-        # answer from the manuals and citations would be misleading.
+        # ── 9. CITE — only emit citations if the agent used sources ───────────
         answer_text = "".join(answer_buf)
         used_sources = "Sources:" in answer_text or "[1]" in answer_text
         citations = build_citations(results) if used_sources else []
         yield _sse_event("citations", CitationsPayload(citations=citations).model_dump_json())
         yield _sse_data("[DONE]")
+
+        # ── 10. Persist assistant message and citations ───────────────────────
+        if is_storage_enabled() and answer_text:
+            citations_dicts = [c.model_dump() for c in citations]
+            status = "error" if stream_error else "complete"
+            await chat_store.append_assistant_message(
+                thread_id,
+                user_id,
+                answer_text,
+                citations=citations_dicts,
+                status=status,
+            )
+            logger.info(
+                "AgentRuntime: assistant message persisted | thread=%s citations=%d status=%s",
+                thread_id, len(citations_dicts), status,
+            )

@@ -1,12 +1,40 @@
-"""FastAPI routes — thin routes delegating to AgentRuntime."""
+"""FastAPI routes — thin routes delegating to AgentRuntime and chat_store.
+
+Chat endpoints (backward-compatible):
+  POST /chat/stream    — SSE streaming answer with citations
+  POST /chat           — non-streaming JSON answer with citations
+
+Conversation management endpoints (new):
+  GET    /conversations                        — list user's threads
+  POST   /conversations                        — create new thread
+  GET    /conversations/{thread_id}/messages   — ordered message history
+  DELETE /conversations/{thread_id}            — soft delete
+  PATCH  /conversations/{thread_id}            — rename title
+
+Identity is resolved per-request from headers via resolve_identity() and
+injected as a FastAPI dependency — no auth logic lives in route handlers.
+"""
+
+from __future__ import annotations
 
 import logging
-from fastapi import APIRouter
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.agent_runtime.agent import AgentRuntime
 from app.agent_runtime.session import AgentSession
-from app.api.schemas import ChatRequest
+from app.api.schemas import (
+    ChatRequest,
+    ConversationResponse,
+    CreateConversationRequest,
+    MessageResponse,
+    UpdateConversationRequest,
+)
+from app.auth.identity import UserIdentity, resolve_identity
+from app.storage import chat_store
+from app.storage.cosmos_client import is_storage_enabled
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -14,21 +42,68 @@ router = APIRouter()
 _runtime = AgentRuntime()
 
 
-@router.post("/chat/stream")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
-    """Stream a grounded answer with citations via Server-Sent Events."""
-    logger.info(
-        "POST /chat/stream | session=%s | question=%s",
-        request.session_id,
-        request.question,
+# ---------------------------------------------------------------------------
+# Dependency — identity resolver
+# ---------------------------------------------------------------------------
+
+async def get_identity(request: Request) -> UserIdentity:
+    """FastAPI dependency: resolve user identity from request headers."""
+    return resolve_identity(request)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _conv_to_response(conv) -> ConversationResponse:
+    return ConversationResponse(
+        thread_id=conv.thread_id,
+        user_id=conv.user_id,
+        title=conv.title,
+        created_at=conv.created_at,
+        updated_at=conv.updated_at,
+        last_message_at=conv.last_message_at,
+        last_user_message_preview=conv.last_user_message_preview,
+        last_assistant_message_preview=conv.last_assistant_message_preview,
+        message_count=conv.message_count,
+        is_deleted=conv.is_deleted,
     )
 
-    session = AgentSession(question=request.question)
-    if request.session_id:
-        session.session_id = request.session_id
+
+def _msg_to_response(msg) -> MessageResponse:
+    return MessageResponse(
+        id=msg.id,
+        thread_id=msg.thread_id,
+        role=msg.role,
+        content=msg.content,
+        citations=msg.citations,
+        created_at=msg.created_at,
+        sequence=msg.sequence,
+        status=msg.status,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoints (backward-compatible)
+# ---------------------------------------------------------------------------
+
+@router.post("/chat/stream")
+async def chat_stream(
+    body: ChatRequest,
+    identity: UserIdentity = Depends(get_identity),
+) -> StreamingResponse:
+    """Stream a grounded answer with citations via Server-Sent Events."""
+    logger.info(
+        "POST /chat/stream | user=%s session=%s | question=%s",
+        identity.user_id, body.session_id, body.question,
+    )
+
+    session = AgentSession(question=body.question)
+    if body.session_id:
+        session.session_id = body.session_id
 
     return StreamingResponse(
-        _runtime.run_stream(request.question, session),
+        _runtime.run_stream(body.question, session, identity),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -38,38 +113,27 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
 
 
 @router.post("/chat")
-async def chat(request: ChatRequest) -> dict:
+async def chat(
+    body: ChatRequest,
+    identity: UserIdentity = Depends(get_identity),
+) -> dict:
     """Return a grounded answer and citations as normal JSON."""
     logger.info(
-        "POST /chat | session=%s | question=%s",
-        request.session_id,
-        request.question,
+        "POST /chat | user=%s session=%s | question=%s",
+        identity.user_id, body.session_id, body.question,
     )
 
-    session = AgentSession(question=request.question)
-    if request.session_id:
-        session.session_id = request.session_id
+    session = AgentSession(question=body.question)
+    if body.session_id:
+        session.session_id = body.session_id
 
-    # Reuse runtime logic if available
-    if hasattr(_runtime, "run"):
-        result = await _runtime.run(request.question, session)
+    # Consume the streaming generator and reconstruct final answer + citations
+    import json as _json
 
-        if isinstance(result, dict):
-            return {
-                "answer": result.get("answer", ""),
-                "citations": result.get("citations", []),
-            }
-
-        return {
-            "answer": str(result),
-            "citations": [],
-        }
-
-    # Fallback: consume the existing stream and reconstruct final answer/citations
     answer_parts = []
     citations = []
 
-    async for chunk in _runtime.run_stream(request.question, session):
+    async for chunk in _runtime.run_stream(body.question, session, identity):
         if not isinstance(chunk, str):
             continue
 
@@ -82,19 +146,16 @@ async def chat(request: ChatRequest) -> dict:
             break
 
         if line.startswith("data: "):
-            value = line[len("data: ") :]
+            value = line[len("data: "):]
 
-            # try citations payload
             if value.startswith("{") and '"citations"' in value:
                 try:
-                    import json
-                    payload = json.loads(value)
+                    payload = _json.loads(value)
                     citations.extend(payload.get("citations", []))
                     continue
                 except Exception:
                     pass
 
-            # ignore keepalive
             if value == "keepalive":
                 continue
 
@@ -103,4 +164,113 @@ async def chat(request: ChatRequest) -> dict:
     return {
         "answer": "".join(answer_parts).strip(),
         "citations": citations,
+        "thread_id": session.session_id,
+        "session_id": session.session_id,  # backward-compat alias
     }
+
+
+# ---------------------------------------------------------------------------
+# Conversation management endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/conversations")
+async def list_conversations(
+    identity: UserIdentity = Depends(get_identity),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[ConversationResponse]:
+    """Return recent conversations for the resolved user, newest first."""
+    if not is_storage_enabled():
+        return []
+
+    convs = await chat_store.list_conversations(identity.user_id, limit=limit)
+    return [_conv_to_response(c) for c in convs]
+
+
+@router.post("/conversations")
+async def create_conversation(
+    body: CreateConversationRequest,
+    identity: UserIdentity = Depends(get_identity),
+) -> ConversationResponse:
+    """Create a new empty conversation thread and return its thread_id."""
+    thread_id = str(uuid.uuid4())
+    title = body.title or "New Chat"
+
+    if is_storage_enabled():
+        conv = await chat_store.create_conversation(
+            thread_id=thread_id,
+            user_id=identity.user_id,
+            user_name=identity.user_name,
+            title=title,
+        )
+        if conv is None:
+            raise HTTPException(status_code=503, detail="Storage unavailable")
+        return _conv_to_response(conv)
+
+    # Storage disabled — return a minimal in-memory representation
+    from app.storage.models import ConversationRecord
+    conv = ConversationRecord(
+        id=thread_id,
+        thread_id=thread_id,
+        user_id=identity.user_id,
+        user_name=identity.user_name,
+        title=title,
+    )
+    return _conv_to_response(conv)
+
+
+@router.get("/conversations/{thread_id}/messages")
+async def get_conversation_messages(
+    thread_id: str,
+    identity: UserIdentity = Depends(get_identity),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[MessageResponse]:
+    """Return ordered message history for a thread."""
+    if not is_storage_enabled():
+        return []
+
+    # Validate ownership — ensure the thread belongs to this user
+    conv = await chat_store.get_conversation(thread_id, identity.user_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    messages = await chat_store.get_messages(thread_id, max_turns=limit)
+    return [_msg_to_response(m) for m in messages]
+
+
+@router.delete("/conversations/{thread_id}")
+async def delete_conversation(
+    thread_id: str,
+    identity: UserIdentity = Depends(get_identity),
+) -> dict:
+    """Soft-delete a conversation (marks is_deleted=true, does not remove data)."""
+    if not is_storage_enabled():
+        return {"deleted": False, "reason": "storage_disabled"}
+
+    success = await chat_store.soft_delete_conversation(thread_id, identity.user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return {"deleted": True, "thread_id": thread_id}
+
+
+@router.patch("/conversations/{thread_id}")
+async def update_conversation(
+    thread_id: str,
+    body: UpdateConversationRequest,
+    identity: UserIdentity = Depends(get_identity),
+) -> ConversationResponse:
+    """Rename a conversation thread."""
+    if not is_storage_enabled():
+        raise HTTPException(status_code=503, detail="Storage unavailable")
+
+    success = await chat_store.update_conversation_title(
+        thread_id, identity.user_id, body.title
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    conv = await chat_store.get_conversation(thread_id, identity.user_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return _conv_to_response(conv)
