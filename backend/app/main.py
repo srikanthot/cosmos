@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
-from app.config.settings import ALLOWED_ORIGINS
+from app.config.settings import ALLOWED_ORIGINS, CORS_ALLOW_CREDENTIALS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,12 +42,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — configurable via ALLOWED_ORIGINS env var (comma-separated).
-# Defaults to "*" so local dev and Azure dev deployments work without configuration.
+# CORS — production-safe:
+#   ALLOWED_ORIGINS="*"         → wildcard, credentials disabled (browser-safe)
+#   ALLOWED_ORIGINS=<explicit>  → named origins, credentials enabled
+# Both modes are set automatically from the ALLOWED_ORIGINS env var.
+# See settings.py for the derivation logic.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

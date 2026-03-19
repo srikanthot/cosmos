@@ -77,13 +77,24 @@ SCORE_GAP_MIN_RATIO: float = float(os.getenv("SCORE_GAP_MIN_RATIO", "0.55"))
 TRACE_MODE: bool = os.getenv("TRACE_MODE", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
-# CORS — comma-separated origins, or "*" to allow all (default for dev/local)
+# CORS
+# ---------------------------------------------------------------------------
+# ALLOWED_ORIGINS: "*" for local dev (no credentials), or a comma-separated
+# list of explicit origins for browser-credentialed requests from a deployed
+# frontend (e.g. http://localhost:8501,https://myapp.azurewebsites.net).
+#
+# Production rule: the CORS spec forbids combining allow_credentials=True
+# with a wildcard origin.  We enforce this automatically:
+#   - ALLOWED_ORIGINS=*           → allow_credentials=False  (open, no creds)
+#   - ALLOWED_ORIGINS=<explicit>  → allow_credentials=True   (credentialed OK)
 # ---------------------------------------------------------------------------
 _allowed_origins_raw: str = os.getenv("ALLOWED_ORIGINS", "*")
 if _allowed_origins_raw.strip() == "*":
     ALLOWED_ORIGINS: list[str] = ["*"]
+    CORS_ALLOW_CREDENTIALS: bool = False
 else:
     ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
+    CORS_ALLOW_CREDENTIALS = True
 
 # ---------------------------------------------------------------------------
 # Azure Cosmos DB — persistent chat history

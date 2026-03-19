@@ -8,9 +8,12 @@ Container layout:
   conversations  — partitioned by /user_id
   messages       — partitioned by /thread_id
 
-Sequence numbers are derived from the conversation's message_count field, which
-is incremented atomically as part of each message append.  This is safe for the
-single-writer-per-thread pattern of a conversational chatbot.
+Sequence safety:
+  _append_message() uses optimistic concurrency (CAS) on the conversation
+  document's _etag to atomically reserve the next sequence number and update
+  metadata.  On a concurrent write conflict (HTTP 412) it retries up to
+  _MAX_CAS_RETRIES times before giving up.  This prevents duplicate sequence
+  numbers under concurrent requests for the same thread.
 """
 
 from __future__ import annotations
@@ -19,6 +22,9 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Optional
+
+from azure.core.conditions import MatchConditions
+from azure.cosmos.exceptions import CosmosHttpResponseError
 
 from app.storage.cosmos_client import (
     get_conversations_container,
@@ -30,23 +36,27 @@ from app.storage.models import ConversationRecord, MessageRecord
 logger = logging.getLogger(__name__)
 
 _PREVIEW_MAX_CHARS = 120
+_MAX_CAS_RETRIES = 5
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _utcnow_iso() -> str:
+    return _utcnow().isoformat()
+
+
 def _preview(text: str) -> str:
-    """Truncate to PREVIEW_MAX_CHARS at a word boundary."""
+    """Truncate to _PREVIEW_MAX_CHARS at a word boundary."""
     text = text.strip()
     if len(text) <= _PREVIEW_MAX_CHARS:
         return text
-    truncated = text[:_PREVIEW_MAX_CHARS].rsplit(" ", 1)[0]
-    return truncated + "…"
+    return text[:_PREVIEW_MAX_CHARS].rsplit(" ", 1)[0] + "…"
 
 
 def generate_title(question: str) -> str:
@@ -63,7 +73,6 @@ def generate_title(question: str) -> str:
     """
     q = question.strip().rstrip("?.!")
 
-    # Strip common leading question/filler phrases
     filler = re.compile(
         r"^(?:"
         r"what(?:\s+are|\s+is|\s+were|\s+was)?\s+(?:the\s+)?(?:steps?\s+(?:for|to|of)\s+)?"
@@ -79,13 +88,10 @@ def generate_title(question: str) -> str:
     if not q:
         return "New Chat"
 
-    # Capitalize first letter
     q = q[0].upper() + q[1:]
 
-    # Truncate to 70 chars at word boundary
     if len(q) > 70:
-        truncated = q[:67].rsplit(" ", 1)[0]
-        q = truncated + "…"
+        q = q[:67].rsplit(" ", 1)[0] + "…"
 
     return q
 
@@ -121,8 +127,7 @@ async def create_conversation(
         title=title,
     )
     try:
-        body = conv.model_dump(mode="json")
-        await container.upsert_item(body=body)
+        await container.upsert_item(body=conv.model_dump(mode="json"))
         logger.info(
             "chat_store: conversation created | thread=%s user=%s title=%r",
             thread_id, user_id, title,
@@ -140,7 +145,7 @@ async def get_conversation(
     thread_id: str,
     user_id: str,
 ) -> Optional[ConversationRecord]:
-    """Read a conversation by thread_id.  Returns None if not found or storage disabled."""
+    """Read a conversation by thread_id. Returns None if not found or storage disabled."""
     if not is_storage_enabled():
         return None
 
@@ -148,14 +153,18 @@ async def get_conversation(
     try:
         doc = await container.read_item(item=thread_id, partition_key=user_id)
         return _doc_to_conversation(doc)
-    except Exception as exc:
-        # 404 is normal (new thread); log others as warnings
-        status = getattr(exc, "status_code", None)
-        if status != 404:
+    except CosmosHttpResponseError as exc:
+        if exc.status_code != 404:
             logger.warning(
                 "chat_store: failed to read conversation | thread=%s user=%s | %s",
                 thread_id, user_id, exc,
             )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "chat_store: failed to read conversation | thread=%s user=%s | %s",
+            thread_id, user_id, exc,
+        )
         return None
 
 
@@ -196,19 +205,12 @@ async def list_conversations(
     ]
     try:
         items = []
-        async for doc in container.query_items(
-            query=query,
-            parameters=params,
-        ):
+        async for doc in container.query_items(query=query, parameters=params):
             items.append(_doc_to_conversation(doc))
-        logger.info(
-            "chat_store: listed %d conversations | user=%s", len(items), user_id
-        )
+        logger.info("chat_store: listed %d conversations | user=%s", len(items), user_id)
         return items
     except Exception:
-        logger.exception(
-            "chat_store: failed to list conversations | user=%s", user_id
-        )
+        logger.exception("chat_store: failed to list conversations | user=%s", user_id)
         return []
 
 
@@ -227,8 +229,7 @@ async def soft_delete_conversation(thread_id: str, user_id: str) -> bool:
         conv.updated_at = _utcnow()
         await container.upsert_item(body=conv.model_dump(mode="json"))
         logger.info(
-            "chat_store: conversation soft-deleted | thread=%s user=%s",
-            thread_id, user_id,
+            "chat_store: conversation soft-deleted | thread=%s user=%s", thread_id, user_id
         )
         return True
     except Exception:
@@ -238,11 +239,7 @@ async def soft_delete_conversation(thread_id: str, user_id: str) -> bool:
         return False
 
 
-async def update_conversation_title(
-    thread_id: str,
-    user_id: str,
-    title: str,
-) -> bool:
+async def update_conversation_title(thread_id: str, user_id: str, title: str) -> bool:
     """Update the title of a conversation."""
     if not is_storage_enabled():
         return False
@@ -256,57 +253,18 @@ async def update_conversation_title(
         conv.title = title
         conv.updated_at = _utcnow()
         await container.upsert_item(body=conv.model_dump(mode="json"))
-        logger.info(
-            "chat_store: title updated | thread=%s title=%r", thread_id, title
-        )
+        logger.info("chat_store: title updated | thread=%s title=%r", thread_id, title)
         return True
     except Exception:
-        logger.exception(
-            "chat_store: failed to update title | thread=%s", thread_id
-        )
+        logger.exception("chat_store: failed to update title | thread=%s", thread_id)
         return False
-
-
-async def _update_conversation_after_message(
-    thread_id: str,
-    user_id: str,
-    role: str,
-    content: str,
-    first_user_message: bool = False,
-) -> None:
-    """Update conversation metadata after a message is appended."""
-    conv = await get_conversation(thread_id, user_id)
-    if conv is None:
-        return
-
-    container = get_conversations_container()
-    now = _utcnow()
-    conv.updated_at = now
-    conv.last_message_at = now
-    conv.message_count += 1
-
-    preview = _preview(content)
-    if role == "user":
-        conv.last_user_message_preview = preview
-        if first_user_message:
-            conv.title = generate_title(content)
-    else:
-        conv.last_assistant_message_preview = preview
-
-    try:
-        await container.upsert_item(body=conv.model_dump(mode="json"))
-    except Exception:
-        logger.exception(
-            "chat_store: failed to update conversation metadata | thread=%s",
-            thread_id,
-        )
 
 
 # ---------------------------------------------------------------------------
 # Message operations
 # ---------------------------------------------------------------------------
 
-async def append_message(
+async def _append_message(
     thread_id: str,
     user_id: str,
     role: str,
@@ -314,53 +272,133 @@ async def append_message(
     citations: Optional[list[dict]] = None,
     status: str = "complete",
 ) -> Optional[MessageRecord]:
-    """Append a user or assistant message and update conversation metadata."""
+    """Atomically reserve the next sequence number and persist a message.
+
+    Uses optimistic concurrency (CAS) on the conversation document's _etag:
+      1. Read the conversation document and capture its _etag.
+      2. Compute next sequence = message_count + 1 and update all metadata fields.
+      3. replace_item() with IfNotModified condition — atomically commits the
+         incremented count and updated metadata.
+      4. If another writer concurrently modified the document (HTTP 412), retry
+         from step 1 up to _MAX_CAS_RETRIES times.
+      5. Once the sequence slot is reserved, upsert the message document.
+         Message documents use UUID ids so concurrent messages never collide.
+
+    If the message upsert fails after a successful sequence reservation, the
+    sequence slot is lost (message_count is ahead by one) — this is logged
+    explicitly so it can be detected and the count corrected if needed.
+    """
     if not is_storage_enabled():
         return None
 
-    container = get_messages_container()
     conv_container = get_conversations_container()
+    msg_container = get_messages_container()
 
-    # Determine sequence — read current message_count as sequence base
-    conv = await get_conversation(thread_id, user_id)
-    current_count = conv.message_count if conv else 0
-    sequence = current_count + 1
+    for attempt in range(_MAX_CAS_RETRIES):
+        # ── Step 1: Read conversation with its current etag ───────────────
+        try:
+            doc = await conv_container.read_item(item=thread_id, partition_key=user_id)
+        except CosmosHttpResponseError as exc:
+            if exc.status_code == 404:
+                logger.error(
+                    "chat_store: conversation not found for message append | thread=%s",
+                    thread_id,
+                )
+                return None
+            logger.exception(
+                "chat_store: error reading conversation for append | thread=%s", thread_id
+            )
+            return None
 
-    msg = MessageRecord(
-        thread_id=thread_id,
-        user_id=user_id,
-        role=role,
-        content=content,
-        citations=citations or [],
-        sequence=sequence,
-        status=status,
-    )
+        etag: str | None = doc.get("_etag")
+        current_count: int = doc.get("message_count", 0)
+        sequence: int = current_count + 1
+        now_iso = _utcnow_iso()
 
-    try:
-        await container.upsert_item(body=msg.model_dump(mode="json"))
-        logger.info(
-            "chat_store: message saved | thread=%s role=%s seq=%d len=%d",
-            thread_id, role, sequence, len(content),
+        # ── Step 2: Apply metadata updates to the in-memory doc ───────────
+        is_first_user_msg = (role == "user" and current_count == 0)
+        preview = _preview(content)
+
+        doc["message_count"] = sequence
+        doc["updated_at"] = now_iso
+        doc["last_message_at"] = now_iso
+
+        if role == "user":
+            doc["last_user_message_preview"] = preview
+            # Auto-generate title on first user message
+            if is_first_user_msg and doc.get("title") == "New Chat":
+                doc["title"] = generate_title(content)
+        else:
+            doc["last_assistant_message_preview"] = preview
+
+        # ── Step 3: Atomic CAS update — reserve the sequence slot ─────────
+        try:
+            replace_kwargs: dict = {}
+            if etag:
+                replace_kwargs["match_condition"] = MatchConditions.IfNotModified
+                replace_kwargs["etag"] = etag
+
+            await conv_container.replace_item(
+                item=thread_id,
+                body=doc,
+                **replace_kwargs,
+            )
+
+        except CosmosHttpResponseError as exc:
+            if exc.status_code == 412 and attempt < _MAX_CAS_RETRIES - 1:
+                # Concurrent modification — retry with fresh read
+                logger.debug(
+                    "chat_store: CAS conflict on seq reservation, retrying "
+                    "(attempt=%d/%d) | thread=%s",
+                    attempt + 1, _MAX_CAS_RETRIES, thread_id,
+                )
+                continue
+            logger.exception(
+                "chat_store: failed to reserve sequence after %d attempt(s) | thread=%s",
+                attempt + 1, thread_id,
+            )
+            return None
+
+        # ── Step 4: Sequence reserved — persist the message document ──────
+        msg = MessageRecord(
+            thread_id=thread_id,
+            user_id=user_id,
+            role=role,
+            content=content,
+            citations=citations or [],
+            sequence=sequence,
+            status=status,
         )
-    except Exception:
-        logger.exception(
-            "chat_store: failed to save message | thread=%s role=%s", thread_id, role
-        )
-        return None
+        try:
+            await msg_container.upsert_item(body=msg.model_dump(mode="json"))
+            logger.info(
+                "chat_store: message saved | thread=%s role=%s seq=%d len=%d",
+                thread_id, role, sequence, len(content),
+            )
+            return msg
+        except Exception:
+            logger.exception(
+                "chat_store: message save failed after sequence reservation — "
+                "sequence slot %d will be unused | thread=%s",
+                sequence, thread_id,
+            )
+            return None
 
-    # Update conversation metadata (non-blocking; failure logged but not raised)
-    is_first_user_msg = (role == "user" and current_count == 0)
-    await _update_conversation_after_message(
-        thread_id, user_id, role, content, first_user_message=is_first_user_msg
+    # Exhausted all retries
+    logger.error(
+        "chat_store: exhausted %d CAS retries for sequence reservation | thread=%s",
+        _MAX_CAS_RETRIES, thread_id,
     )
-
-    return msg
+    return None
 
 
 async def append_user_message(
-    thread_id: str, user_id: str, content: str
+    thread_id: str,
+    user_id: str,
+    content: str,
 ) -> Optional[MessageRecord]:
-    return await append_message(thread_id, user_id, "user", content)
+    """Append a user message and atomically update conversation metadata."""
+    return await _append_message(thread_id, user_id, "user", content)
 
 
 async def append_assistant_message(
@@ -370,41 +408,63 @@ async def append_assistant_message(
     citations: Optional[list[dict]] = None,
     status: str = "complete",
 ) -> Optional[MessageRecord]:
-    return await append_message(
-        thread_id, user_id, "assistant", content, citations=citations, status=status
+    """Append an assistant message and atomically update conversation metadata."""
+    return await _append_message(
+        thread_id, user_id, "assistant", content,
+        citations=citations, status=status,
     )
 
 
 async def get_messages(
     thread_id: str,
     max_turns: int = 12,
+    before_sequence: Optional[int] = None,
 ) -> list[MessageRecord]:
-    """Return the most recent messages for a thread, in ascending sequence order."""
+    """Return messages for a thread in ascending sequence order.
+
+    Parameters
+    ----------
+    thread_id:
+        The conversation thread to query.
+    max_turns:
+        Maximum number of messages to return (most recent N).
+    before_sequence:
+        When set, only messages with sequence < before_sequence are returned.
+        Used by AgentRuntime cold-start hydration to exclude the current
+        user message that was just persisted, preventing it from appearing
+        in both the injected history block and the active user prompt.
+    """
     if not is_storage_enabled():
         return []
 
     container = get_messages_container()
-    # Fetch the last max_turns messages ordered by sequence ascending
+
+    # Build query with optional sequence filter
+    seq_clause = ""
+    params: list[dict] = [{"name": "@thread_id", "value": thread_id}]
+
+    if before_sequence is not None:
+        seq_clause = "AND c.sequence < @before_sequence"
+        params.append({"name": "@before_sequence", "value": before_sequence})
+
+    params.append({"name": "@limit", "value": max_turns})
+
     query = (
-        "SELECT * FROM c WHERE c.thread_id = @thread_id "
-        "ORDER BY c.sequence DESC OFFSET 0 LIMIT @limit"
+        f"SELECT * FROM c WHERE c.thread_id = @thread_id {seq_clause} "
+        f"ORDER BY c.sequence DESC OFFSET 0 LIMIT @limit"
     )
-    params = [
-        {"name": "@thread_id", "value": thread_id},
-        {"name": "@limit", "value": max_turns},
-    ]
+
     try:
         items = []
         async for doc in container.query_items(query=query, parameters=params):
             items.append(_doc_to_message(doc))
-        # Reverse to get ascending order (oldest first)
+        # Reverse to restore ascending (chronological) order
         items.reverse()
         logger.info(
-            "chat_store: loaded %d messages | thread=%s", len(items), thread_id
+            "chat_store: loaded %d messages | thread=%s before_seq=%s",
+            len(items), thread_id, before_sequence,
         )
         return items
     except Exception:
-        logger.exception(
-            "chat_store: failed to load messages | thread=%s", thread_id
-        )
+        logger.exception("chat_store: failed to load messages | thread=%s", thread_id)
         return []

@@ -3,8 +3,10 @@
 Chat endpoints (backward-compatible):
   POST /chat/stream    — SSE streaming answer with citations
   POST /chat           — non-streaming JSON answer with citations
+                         Uses AgentRuntime.run_once() directly; does NOT
+                         parse SSE text to reconstruct the response.
 
-Conversation management endpoints (new):
+Conversation management endpoints:
   GET    /conversations                        — list user's threads
   POST   /conversations                        — create new thread
   GET    /conversations/{thread_id}/messages   — ordered message history
@@ -83,8 +85,16 @@ def _msg_to_response(msg) -> MessageResponse:
     )
 
 
+def _make_session(body: ChatRequest) -> AgentSession:
+    """Create an AgentSession from the request body, honouring session_id alias."""
+    session = AgentSession(question=body.question)
+    if body.session_id:
+        session.session_id = body.session_id
+    return session
+
+
 # ---------------------------------------------------------------------------
-# Chat endpoints (backward-compatible)
+# Chat endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/chat/stream")
@@ -97,11 +107,7 @@ async def chat_stream(
         "POST /chat/stream | user=%s session=%s | question=%s",
         identity.user_id, body.session_id, body.question,
     )
-
-    session = AgentSession(question=body.question)
-    if body.session_id:
-        session.session_id = body.session_id
-
+    session = _make_session(body)
     return StreamingResponse(
         _runtime.run_stream(body.question, session, identity),
         media_type="text/event-stream",
@@ -117,56 +123,18 @@ async def chat(
     body: ChatRequest,
     identity: UserIdentity = Depends(get_identity),
 ) -> dict:
-    """Return a grounded answer and citations as normal JSON."""
+    """Return a grounded answer and citations as normal JSON.
+
+    Delegates directly to AgentRuntime.run_once() — no SSE parsing involved.
+    """
     logger.info(
         "POST /chat | user=%s session=%s | question=%s",
         identity.user_id, body.session_id, body.question,
     )
-
-    session = AgentSession(question=body.question)
-    if body.session_id:
-        session.session_id = body.session_id
-
-    # Consume the streaming generator and reconstruct final answer + citations
-    import json as _json
-
-    answer_parts = []
-    citations = []
-
-    async for chunk in _runtime.run_stream(body.question, session, identity):
-        if not isinstance(chunk, str):
-            continue
-
-        line = chunk.strip()
-
-        if line.startswith("event: citations"):
-            continue
-
-        if line.startswith("data: [DONE]"):
-            break
-
-        if line.startswith("data: "):
-            value = line[len("data: "):]
-
-            if value.startswith("{") and '"citations"' in value:
-                try:
-                    payload = _json.loads(value)
-                    citations.extend(payload.get("citations", []))
-                    continue
-                except Exception:
-                    pass
-
-            if value == "keepalive":
-                continue
-
-            answer_parts.append(value.replace("\\n", "\n"))
-
-    return {
-        "answer": "".join(answer_parts).strip(),
-        "citations": citations,
-        "thread_id": session.session_id,
-        "session_id": session.session_id,  # backward-compat alias
-    }
+    session = _make_session(body)
+    result = await _runtime.run_once(body.question, session, identity)
+    # run_once already returns the correct shape; pass through unchanged.
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +149,6 @@ async def list_conversations(
     """Return recent conversations for the resolved user, newest first."""
     if not is_storage_enabled():
         return []
-
     convs = await chat_store.list_conversations(identity.user_id, limit=limit)
     return [_conv_to_response(c) for c in convs]
 
@@ -206,7 +173,7 @@ async def create_conversation(
             raise HTTPException(status_code=503, detail="Storage unavailable")
         return _conv_to_response(conv)
 
-    # Storage disabled — return a minimal in-memory representation
+    # Storage disabled — return a minimal ephemeral representation
     from app.storage.models import ConversationRecord
     conv = ConversationRecord(
         id=thread_id,
@@ -228,7 +195,7 @@ async def get_conversation_messages(
     if not is_storage_enabled():
         return []
 
-    # Validate ownership — ensure the thread belongs to this user
+    # Ownership check — thread must belong to this user
     conv = await chat_store.get_conversation(thread_id, identity.user_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
