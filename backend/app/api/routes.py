@@ -13,6 +13,16 @@ Conversation management endpoints:
   DELETE /conversations/{thread_id}            — soft delete
   PATCH  /conversations/{thread_id}            — rename title
 
+Multi-user isolation:
+  When the client supplies a session_id in a chat request, the route
+  validates that the conversation exists for the resolved user BEFORE
+  dispatching to AgentRuntime.  If the thread_id is not owned by this user,
+  the route returns HTTP 404 immediately.  AgentRuntime performs a second
+  defensive check as well.
+
+  This approach keeps all HTTP error handling in the route layer and lets
+  AgentRuntime remain decoupled from FastAPI exception types.
+
 Identity is resolved per-request from headers via resolve_identity() and
 injected as a FastAPI dependency — no auth logic lives in route handlers.
 """
@@ -86,11 +96,35 @@ def _msg_to_response(msg) -> MessageResponse:
 
 
 def _make_session(body: ChatRequest) -> AgentSession:
-    """Create an AgentSession from the request body, honouring session_id alias."""
+    """Create an AgentSession from the request body, honouring session_id alias.
+
+    Sets client_provided=True when the caller explicitly supplied a session_id
+    so that AgentRuntime can distinguish between:
+      - a client-provided thread_id that must already exist for this user, and
+      - an auto-generated thread_id that should be created on first use.
+    """
     session = AgentSession(question=body.question)
     if body.session_id:
         session.session_id = body.session_id
+        session.client_provided = True
     return session
+
+
+async def _assert_conversation_ownership(thread_id: str, user_id: str) -> None:
+    """Raise HTTP 404 if the thread does not exist or is not owned by user_id.
+
+    Using 404 (not 403) intentionally: we do not reveal whether the thread
+    exists for a different user — the caller only learns it is not accessible
+    to them.
+    """
+    if not is_storage_enabled():
+        return  # no storage → no ownership to enforce
+    conv = await chat_store.get_conversation(thread_id, user_id)
+    if conv is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found or access denied.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +141,13 @@ async def chat_stream(
         "POST /chat/stream | user=%s session=%s | question=%s",
         identity.user_id, body.session_id, body.question,
     )
+
+    # Ownership check before starting the stream.  If the client supplied a
+    # session_id that is not owned by this user, return 404 now — once the
+    # StreamingResponse starts we can no longer return an HTTP error status.
+    if body.session_id:
+        await _assert_conversation_ownership(body.session_id, identity.user_id)
+
     session = _make_session(body)
     return StreamingResponse(
         _runtime.run_stream(body.question, session, identity),
@@ -131,6 +172,12 @@ async def chat(
         "POST /chat | user=%s session=%s | question=%s",
         identity.user_id, body.session_id, body.question,
     )
+
+    # Ownership check: reject client-supplied thread_ids that don't belong
+    # to this user before any work is done.
+    if body.session_id:
+        await _assert_conversation_ownership(body.session_id, identity.user_id)
+
     session = _make_session(body)
     result = await _runtime.run_once(body.question, session, identity)
     # run_once already returns the correct shape; pass through unchanged.
@@ -191,16 +238,28 @@ async def get_conversation_messages(
     identity: UserIdentity = Depends(get_identity),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> list[MessageResponse]:
-    """Return ordered message history for a thread."""
+    """Return ordered message history for a thread.
+
+    Ownership is enforced by get_messages_for_user() — if the conversation
+    does not exist for this user the function returns [] and 404 is raised here.
+    """
     if not is_storage_enabled():
         return []
 
-    # Ownership check — thread must belong to this user
-    conv = await chat_store.get_conversation(thread_id, identity.user_id)
-    if conv is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    # get_messages_for_user validates ownership and filters by user_id.
+    messages = await chat_store.get_messages_for_user(
+        thread_id, identity.user_id, max_turns=limit
+    )
 
-    messages = await chat_store.get_messages(thread_id, max_turns=limit)
+    # If empty, confirm whether the conversation exists for this user.
+    # An empty list from get_messages_for_user can mean either "no messages yet"
+    # or "conversation not found for this user".  We distinguish them to give
+    # the correct HTTP status.
+    if not messages:
+        conv = await chat_store.get_conversation(thread_id, identity.user_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
     return [_msg_to_response(m) for m in messages]
 
 

@@ -8,6 +8,19 @@ Container layout:
   conversations  — partitioned by /user_id
   messages       — partitioned by /thread_id
 
+Multi-user isolation guarantees:
+  - get_messages_for_user() validates conversation ownership before querying
+    and filters message results by both thread_id AND user_id.  A user can
+    never read another user's messages even if they somehow know the thread_id.
+  - _append_message() reads the conversation using (thread_id, partition_key=user_id).
+    If the conversation does not exist under that user's partition Cosmos returns
+    404 and the append is rejected — a user can never write into another user's
+    thread even if they present the correct thread_id.
+  - create_conversation() uses upsert semantics.  Two users can theoretically
+    hold conversation documents with the same thread_id in different partitions
+    (user_id A and user_id B).  This is harmless because message reads/writes
+    are always scoped to the calling user's user_id.
+
 Sequence safety:
   _append_message() uses optimistic concurrency (CAS) on the conversation
   document's _etag to atomically reserve the next sequence number and update
@@ -145,7 +158,11 @@ async def get_conversation(
     thread_id: str,
     user_id: str,
 ) -> Optional[ConversationRecord]:
-    """Read a conversation by thread_id. Returns None if not found or storage disabled."""
+    """Read a conversation by thread_id scoped to user_id.
+
+    Returns None if not found (including when the thread_id exists but belongs
+    to a different user — Cosmos partition isolation prevents cross-user reads).
+    """
     if not is_storage_enabled():
         return None
 
@@ -166,22 +183,6 @@ async def get_conversation(
             thread_id, user_id, exc,
         )
         return None
-
-
-async def get_or_create_conversation(
-    thread_id: str,
-    user_id: str,
-    user_name: str = "",
-) -> Optional[ConversationRecord]:
-    """Return existing conversation or create a new one."""
-    conv = await get_conversation(thread_id, user_id)
-    if conv is not None:
-        logger.info(
-            "chat_store: conversation loaded | thread=%s user=%s turns=%d",
-            thread_id, user_id, conv.message_count,
-        )
-        return conv
-    return await create_conversation(thread_id, user_id, user_name)
 
 
 async def list_conversations(
@@ -274,7 +275,13 @@ async def _append_message(
 ) -> Optional[MessageRecord]:
     """Atomically reserve the next sequence number and persist a message.
 
-    Uses optimistic concurrency (CAS) on the conversation document's _etag:
+    Ownership enforcement:
+      Step 1 reads the conversation document with partition_key=user_id.  If the
+      conversation does not exist under this user's partition, Cosmos returns 404
+      and we return None.  This prevents a user from writing into a thread they
+      do not own even if they present the correct thread_id.
+
+    CAS (compare-and-swap) loop:
       1. Read the conversation document and capture its _etag.
       2. Compute next sequence = message_count + 1 and update all metadata fields.
       3. replace_item() with IfNotModified condition — atomically commits the
@@ -296,17 +303,21 @@ async def _append_message(
 
     for attempt in range(_MAX_CAS_RETRIES):
         # ── Step 1: Read conversation with its current etag ───────────────
+        # partition_key=user_id enforces ownership: 404 if thread is not owned
+        # by this user.
         try:
             doc = await conv_container.read_item(item=thread_id, partition_key=user_id)
         except CosmosHttpResponseError as exc:
             if exc.status_code == 404:
                 logger.error(
-                    "chat_store: conversation not found for message append | thread=%s",
-                    thread_id,
+                    "chat_store: conversation not found for message append "
+                    "(ownership check) | thread=%s user=%s",
+                    thread_id, user_id,
                 )
                 return None
             logger.exception(
-                "chat_store: error reading conversation for append | thread=%s", thread_id
+                "chat_store: error reading conversation for append | thread=%s user=%s",
+                thread_id, user_id,
             )
             return None
 
@@ -372,15 +383,15 @@ async def _append_message(
         try:
             await msg_container.upsert_item(body=msg.model_dump(mode="json"))
             logger.info(
-                "chat_store: message saved | thread=%s role=%s seq=%d len=%d",
-                thread_id, role, sequence, len(content),
+                "chat_store: message saved | thread=%s user=%s role=%s seq=%d len=%d",
+                thread_id, user_id, role, sequence, len(content),
             )
             return msg
         except Exception:
             logger.exception(
                 "chat_store: message save failed after sequence reservation — "
-                "sequence slot %d will be unused | thread=%s",
-                sequence, thread_id,
+                "sequence slot %d will be unused | thread=%s user=%s",
+                sequence, thread_id, user_id,
             )
             return None
 
@@ -415,17 +426,29 @@ async def append_assistant_message(
     )
 
 
-async def get_messages(
+async def get_messages_for_user(
     thread_id: str,
+    user_id: str,
     max_turns: int = 12,
     before_sequence: Optional[int] = None,
 ) -> list[MessageRecord]:
-    """Return messages for a thread in ascending sequence order.
+    """Return messages for a thread, scoped to the owning user.
+
+    Ownership is validated first: if the conversation does not exist for
+    user_id, an empty list is returned and a warning is logged.
+
+    Messages are additionally filtered by user_id in the query itself
+    (WHERE thread_id = ? AND user_id = ?) as a second layer of isolation.
+    This ensures that even in the theoretical case of two users having
+    conversation documents with the same thread_id (in different Cosmos
+    partitions), each user only sees their own messages.
 
     Parameters
     ----------
     thread_id:
         The conversation thread to query.
+    user_id:
+        The requesting user.  Must match the conversation owner.
     max_turns:
         Maximum number of messages to return (most recent N).
     before_sequence:
@@ -437,11 +460,24 @@ async def get_messages(
     if not is_storage_enabled():
         return []
 
+    # ── Ownership check ───────────────────────────────────────────────────
+    conv = await get_conversation(thread_id, user_id)
+    if conv is None:
+        logger.warning(
+            "chat_store: get_messages_for_user denied — conversation not found "
+            "for this user | thread=%s user=%s",
+            thread_id, user_id,
+        )
+        return []
+
     container = get_messages_container()
 
-    # Build query with optional sequence filter
+    # Build query with mandatory user_id filter and optional sequence filter
     seq_clause = ""
-    params: list[dict] = [{"name": "@thread_id", "value": thread_id}]
+    params: list[dict] = [
+        {"name": "@thread_id", "value": thread_id},
+        {"name": "@user_id",   "value": user_id},
+    ]
 
     if before_sequence is not None:
         seq_clause = "AND c.sequence < @before_sequence"
@@ -450,7 +486,8 @@ async def get_messages(
     params.append({"name": "@limit", "value": max_turns})
 
     query = (
-        f"SELECT * FROM c WHERE c.thread_id = @thread_id {seq_clause} "
+        f"SELECT * FROM c "
+        f"WHERE c.thread_id = @thread_id AND c.user_id = @user_id {seq_clause} "
         f"ORDER BY c.sequence DESC OFFSET 0 LIMIT @limit"
     )
 
@@ -461,10 +498,13 @@ async def get_messages(
         # Reverse to restore ascending (chronological) order
         items.reverse()
         logger.info(
-            "chat_store: loaded %d messages | thread=%s before_seq=%s",
-            len(items), thread_id, before_sequence,
+            "chat_store: loaded %d messages | thread=%s user=%s before_seq=%s",
+            len(items), thread_id, user_id, before_sequence,
         )
         return items
     except Exception:
-        logger.exception("chat_store: failed to load messages | thread=%s", thread_id)
+        logger.exception(
+            "chat_store: failed to load messages | thread=%s user=%s",
+            thread_id, user_id,
+        )
         return []
